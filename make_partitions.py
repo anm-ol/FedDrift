@@ -1,12 +1,8 @@
 import argparse
 import os
 
-from data import (count_matrix, dirichlet_partition, load_cifar10, partition_path,
+from data import (count_matrix, dirichlet_partition, load_cifar10, parse_alpha, partition_path,
                   print_counts, save_partition)
-
-
-def parse_alpha(s):
-    return None if s == "iid" else float(s)
 
 
 def main():
@@ -22,8 +18,6 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     _, labels = load_cifar10(args.data_root)
 
-    #partitions are made once here and only loaded everywhere else,
-    # so every method sees exactly the same clients
     for alpha in args.alphas:
         parts = dirichlet_partition(labels, args.n_clients, alpha, args.seed, args.min_size)
         path = partition_path(args.out_dir, args.n_clients, alpha, args.seed)

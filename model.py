@@ -1,8 +1,6 @@
 import torch.nn as nn
 from diffusers import UNet2DModel
 
-#DDPM CIFAR10 layout - 4 resolution levels 32->16->8->4, attention at 16x16 only
-#"standard" is the std res levels, "small" is half of it and what we use for measurement runs
 WIDTHS = {
     "small": (64, 128, 128, 128),
     "standard": (128, 256, 256, 256),

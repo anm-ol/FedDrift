@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 STYLE = {
+    "class": ("#e87ba4", "v"),
     "0.1": ("#2a78d6", "o"),
     "0.5": ("#eb6834", "s"),
     "5": ("#1baf7a", "^"),
@@ -13,11 +14,11 @@ STYLE = {
 }
 
 PANELS = [
-    ("zeta2_cross_normalized", "dissimilarity / |mean grad|^2", "linear"),
-    ("drift_over_noise", "dissimilarity / within-client variance", "linear"),
-    ("zeta2_corrected", "dissimilarity (half-split corrected)", "log"),
+    ("zeta2_corrected", "drift (absolute, noise removed)", "log"),
+    ("zeta2_normalized", "drift / |mean grad|^2", "log"),
     ("mean_pairwise_cos", "mean pairwise cosine", "linear"),
-    ("within_client_var", "within-client variance", "log"),
+    ("drift_over_noise", "drift / within-client noise", "linear"),
+    ("within_client_var", "within-client noise", "log"),
     ("mean_grad_norm2", "|mean grad|^2", "log"),
 ]
 
@@ -25,7 +26,7 @@ PANELS = [
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", required=True)
-    parser.add_argument("--round", type=int, default=None) 
+    parser.add_argument("--round", type=int, default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -45,7 +46,7 @@ def main():
             xs = [f"{r['bucket'][0]}-{r['bucket'][1]}" for r in sel]
             color, marker = STYLE[a]
             ax.plot(xs, [r[key] for r in sel], color=color, marker=marker, lw=2, ms=7,
-                    label="IID" if a == "iid" else f"alpha={a}")
+                    label={"iid": "IID", "class": "1 class per client"}.get(a, f"alpha={a}"))
         ax.set_yscale(scale)
         ax.set_title(title, fontsize=11)
         ax.set_xlabel("timestep bucket (low noise -> high noise)")
@@ -54,7 +55,7 @@ def main():
     axes[0, 0].legend(frameon=False)
 
     a = log["args"]
-    fig.suptitle(f"client gradient dissimilarity per timestep bucket | round {rnd} | "
+    fig.suptitle(f"client drift per timestep bucket | round {rnd} | "
                  f"FedAvg trained on alpha={a['alpha'] or 'iid'}, {a['n_clients']} clients")
     fig.tight_layout()
     out = args.out or args.json.replace(".json", f"_round{rnd}.png")
