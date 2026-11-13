@@ -13,6 +13,12 @@ def load_cifar10(root="./data", train=True):
     return x, labels
 
 
+def load_cifar100(root="./data", train=True):
+    ds = datasets.CIFAR100(root, train=train, download=True)
+    x = torch.from_numpy(ds.data).permute(0, 3, 1, 2).float() / 127.5 - 1.0
+    return x, np.array(ds.targets)
+
+
 def random_flip(x):
     flip = torch.rand(x.shape[0], device=x.device) < 0.5
     return torch.where(flip.view(-1, 1, 1, 1), x.flip(3), x)
