@@ -1,0 +1,86 @@
+# FedDrift experiments on our k8s GPUs. Adapted from
+# world-captions/skypilot/caption.yaml: workdir-synced (SkyPilot rsyncs the
+# local checkout, honoring .gitignore), outputs persisted under /mnt/data/laplace.
+#
+# Each entry in JOBS is "<script>:<seed>" and gets its own GPU (round-robin
+# if there are more jobs than GPUs). The run_*.sh scripts take the seed as $1.
+#
+#   sky launch skypilot/feddrift.yaml -c anm-feddrift --env-file .env
+#
+#   # RegMean seeds 0/1 plus the FedAvg baselines on 4 GPUs:
+#   sky launch skypilot/feddrift.yaml -c anm-feddrift --env-file .env --gpus H200:4 \
+#     --env "JOBS=run_regmean.sh:0 run_regmean.sh:1 run_fedavg.sh:0 run_fedavg.sh:1"
+#
+#   # re-run on the live cluster after local edits (skips setup):
+#   sky exec anm-feddrift skypilot/feddrift.yaml --env-file .env --env "JOBS=..."
+#
+#   sky logs anm-feddrift            # stream output
+#   sky down anm-feddrift            # release the GPUs when done
+#
+# .env (gitignored) should hold WANDB_API_KEY; without it wandb runs offline.
+
+name: anm-feddrift
+
+resources:
+  image_id: pytorch/pytorch:2.13.0-cuda12.6-cudnn9-devel
+  accelerators: H200:2
+  cpus: 8+
+  memory: 32+
+  cloud: kubernetes
+
+config: { docker: { run_options: ["--pull=always"] } }
+
+workdir: .
+
+envs:
+  JOBS: "run_regmean.sh:0 run_fedavg.sh:0"
+  OUT_ROOT: /mnt/data/laplace/feddrift  # only write under /mnt/data/laplace
+  WANDB_API_KEY: ""
+
+setup: |
+  set -euo pipefail
+  cd ~/sky_workdir
+  uv pip install --system --break-system-packages -r requirements.txt
+
+run: |
+  set -euo pipefail
+  cd ~/sky_workdir
+  # sky exec skips setup; keep deps in sync (no-op when satisfied)
+  uv pip install --system --break-system-packages -q -r requirements.txt
+
+  # runs/, logs/, data/ and fid.txt live on the shared mount so checkpoints
+  # survive `sky down` and measure_drift.py can resume from *_last.tmp
+  mkdir -p "$OUT_ROOT"/{runs,logs,data}
+  for d in runs logs data; do
+    if [ -d "$d" ] && [ ! -L "$d" ]; then cp -rn "$d"/. "$OUT_ROOT/$d"/; rm -rf "$d"; fi
+    ln -sfn "$OUT_ROOT/$d" "$d"
+  done
+  touch "$OUT_ROOT/fid.txt"; ln -sf "$OUT_ROOT/fid.txt" fid.txt
+
+  if [ -z "${WANDB_API_KEY:-}" ]; then
+    echo "[warn] WANDB_API_KEY not set; wandb will run offline"
+    export WANDB_MODE=offline
+  fi
+
+  # download CIFAR once, before parallel jobs race on it
+  python -c "from data import load_cifar10, load_cifar100; load_cifar10('./data'); load_cifar10('./data', train=False); load_cifar100('./data')"
+
+  # same for the class partitions the run_*.sh scripts create on demand
+  for seed in $(for j in $JOBS; do echo "${j##*:}"; done | sort -u); do
+    [ -f "partitions/cifar10_K10_class_seed$seed.json" ] || python make_partitions.py --alphas class --seed "$seed"
+  done
+
+  NGPU=${SKYPILOT_NUM_GPUS_PER_NODE:-1}
+  i=0
+  for job in $JOBS; do
+    script=${job%%:*}; seed=${job##*:}
+    gpu=$((i % NGPU))
+    echo "[job] GPU $gpu: bash $script $seed (log: $OUT_ROOT/logs/sky_${script%.sh}_s$seed.log)"
+    CUDA_VISIBLE_DEVICES=$gpu bash "$script" "$seed" > "logs/sky_${script%.sh}_s$seed.log" 2>&1 &
+    i=$((i + 1))
+  done
+
+  fail=0
+  for pid in $(jobs -p); do wait "$pid" || fail=1; done
+  echo "results in $OUT_ROOT (runs/, logs/, fid.txt)"
+  exit $fail

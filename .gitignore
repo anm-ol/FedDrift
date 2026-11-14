@@ -5,3 +5,4 @@ logs/
 *.pt
 *.log
 fid.txt
+.env
