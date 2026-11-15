@@ -91,21 +91,41 @@ bash run_shared.sh 0
 
 The argument is the seed. Each script writes the client split if it is missing, trains for 100 rounds, saves checkpoints and drift measurements to `runs/`, and appends FIDs at rounds 25, 50 and 100 to `fid.txt`. `run_prox.sh` and `run_distill.sh` each run the uniform and adaptive versions side by side. `run_shared.sh` runs the four shared-data variants for 150 rounds, with FIDs at rounds 100 and 150. Each pair takes about 5 hours on one RTX PRO 6000.
 
+### Other datasets and flow matching
+
+Every `run_*.sh` script reads `DATASET`, `OBJECTIVE` and `ALPHA` from the environment (see `common.sh`):
+
+```bash
+DATASET=celeba64 bash run_regmean.sh 0
+DATASET=tinyimagenet bash run_fedavg.sh 0
+OBJECTIVE=fm bash run_regmean.sh 0
+```
+
+- `cifar10` (default): 32x32, one class per client.
+- `celeba64`: CelebA, 140px centre crop resized to 64x64. It has no classes, so labels are the 8 groups of Male x Smiling x Black_Hair and the split defaults to Dirichlet `ALPHA=0.1`.
+- `tinyimagenet`: 64x64, 20 classes per client.
+
+Both 64x64 datasets are subsampled to 50k training images so client sizes match CIFAR-10. They come from Hugging Face (`flwrlabs/celeba`, `zh-plus/tiny-imagenet`) and are cached as `data/<name>_{train,test}.npz`. The 64x64 UNet adds one full-width level in front of the 32x32 one (9.6M parameters), so attention stays at 16x16.
+
+`OBJECTIVE=fm` swaps DDPM for rectified flow: x_t = (1-τ)x0 + τε with τ = (t+1)/1000. The network predicts ε - x0, and sampling uses 1000 Euler steps. The integer t is kept, so drift bands and RegMean bands are equal-width in τ. They are not equal in SNR, so compare objectives with the logged `snr_mid` per band. Run names get a suffix such as `_celeba64_fm_a0.1`, and the default CIFAR/DDPM names are unchanged. `--mix` and expert routing are DDPM-only.
+
+`skypilot/feddrift.yaml` runs any of these on the cluster, one job per GPU. See the header of that file.
+
 ---
 
 ## Files
 
 | File | What it does |
 |------|-------------|
-| `data.py` | CIFAR-10 as one tensor, client splits |
+| `data.py` | CIFAR-10, CelebA-64, Tiny-ImageNet as one tensor; client splits |
 | `make_partitions.py` | Writes the splits, prints the client x class counts |
 | `model.py` | diffusers UNet2DModel, small (9M) and standard (35.7M) |
-| `diffusion.py` | DDPM schedule, loss with explicit `t` and `eps`, sampler |
+| `diffusion.py` | DDPM and flow-matching schedules, loss with explicit `t` and `eps`, samplers |
 | `fed.py` | Local training with the per-band penalty, and FedAvg |
 | `drift.py` | The per-band drift measurement |
 | `measure_drift.py` | Federated training loop: drift measurement, adaptive strengths, probe images |
 | `sample.py` | Sampling from a checkpoint |
-| `fid.py` | FID against the CIFAR-10 training set |
+| `fid.py` | FID against the 50k training images of the dataset |
 | `test_drift.py` | Cats-only vs dogs-only clients must show more drift than mixed clients |
 | `plot.py` | Drift per band, one figure per measured round |
 

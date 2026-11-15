@@ -2,14 +2,20 @@
 # world-captions/skypilot/caption.yaml: workdir-synced (SkyPilot rsyncs the
 # local checkout, honoring .gitignore), outputs persisted under /mnt/data/laplace.
 #
-# Each entry in JOBS is "<script>:<seed>" and gets its own GPU (round-robin
-# if there are more jobs than GPUs). The run_*.sh scripts take the seed as $1.
+# Each entry in JOBS is "<script>:<seed>[:<dataset>[:<objective>]]" and gets its own
+# GPU (round-robin if there are more jobs than GPUs). dataset is cifar10 (default),
+# celeba64 or tinyimagenet; objective is ddpm (default) or fm (flow matching).
+# ALPHA overrides the split for every job (default: class, or 0.1 for celeba64).
 #
-#   sky launch skypilot/feddrift.yaml -c anm-feddrift --env-file .env
+#   sky launch skypilot/feddrift.yaml -c anm-feddrift --env-file .env --down -y -d
 #
 #   # RegMean seeds 0/1 plus the FedAvg baselines on 4 GPUs:
 #   sky launch skypilot/feddrift.yaml -c anm-feddrift --env-file .env --gpus H200:4 \
 #     --env "JOBS=run_regmean.sh:0 run_regmean.sh:1 run_fedavg.sh:0 run_fedavg.sh:1"
+#
+#   # FedAvg vs RegMean on the new datasets, and flow matching on CIFAR:
+#   sky launch skypilot/feddrift.yaml -c anm-feddrift --env-file .env --gpus H200:6 \
+#     --env "JOBS=run_fedavg.sh:0:celeba64 run_regmean.sh:0:celeba64 run_fedavg.sh:0:tinyimagenet run_regmean.sh:0:tinyimagenet run_fedavg.sh:0:cifar10:fm run_regmean.sh:0:cifar10:fm"
 #
 #   # re-run on the live cluster after local edits (skips setup):
 #   sky exec anm-feddrift skypilot/feddrift.yaml --env-file .env --env "JOBS=..."
@@ -27,6 +33,10 @@ resources:
   cpus: 8+
   memory: 32+
   cloud: kubernetes
+  # tear the cluster down once the run finishes and it sits idle (always launch with this)
+  autostop:
+    idle_minutes: 10
+    down: true
 
 config: { docker: { run_options: ["--pull=always"] } }
 
@@ -35,6 +45,7 @@ workdir: .
 envs:
   JOBS: "run_regmean.sh:0 run_fedavg.sh:0"
   OUT_ROOT: /mnt/data/laplace/feddrift  # only write under /mnt/data/laplace
+  ALPHA: ""
   WANDB_API_KEY: ""
 
 setup: |
@@ -57,26 +68,39 @@ run: |
   done
   touch "$OUT_ROOT/fid.txt"; ln -sf "$OUT_ROOT/fid.txt" fid.txt
 
+  export WANDB_DIR="$OUT_ROOT"; mkdir -p "$OUT_ROOT/wandb"
   if [ -z "${WANDB_API_KEY:-}" ]; then
-    echo "[warn] WANDB_API_KEY not set; wandb will run offline"
+    echo "[warn] WANDB_API_KEY not set; wandb runs offline into $OUT_ROOT/wandb (wandb sync later)"
     export WANDB_MODE=offline
   fi
 
-  # download CIFAR once, before parallel jobs race on it
-  python -c "from data import load_cifar10, load_cifar100; load_cifar10('./data'); load_cifar10('./data', train=False); load_cifar100('./data')"
+  [ -n "$ALPHA" ] && export ALPHA || unset ALPHA
 
-  # same for the class partitions the run_*.sh scripts create on demand
-  for seed in $(for j in $JOBS; do echo "${j##*:}"; done | sort -u); do
-    [ -f "partitions/cifar10_K10_class_seed$seed.json" ] || python make_partitions.py --alphas class --seed "$seed"
+  # fetch + cache each dataset once (into the shared data/) and write its partitions, in
+  # parallel per dataset; each job starts as soon as its own dataset is ready, so CIFAR and
+  # Tiny-ImageNet jobs don't wait on CelebA's first ~12GB stream
+  R=/tmp/feddrift_ready; rm -rf $R; mkdir -p $R
+  for spec in $(for j in $JOBS; do IFS=: read -r _ s d _ <<< "$j"; echo "${d:-cifar10}:$s"; done | sort -u); do
+    d=${spec%%:*}; s=${spec##*:}
+    a=${ALPHA:-$([ "$d" = celeba64 ] && echo 0.1 || echo class)}
+    ( if python -c "from data import load_dataset; load_dataset('$d', './data'); load_dataset('$d', './data', train=False)" \
+           > "logs/sky_prefetch_$d.log" 2>&1 \
+         && python make_partitions.py --dataset "$d" --alphas "$a" --seed "$s" >> "logs/sky_prefetch_$d.log" 2>&1
+      then touch "$R/$spec.ok"; else touch "$R/$spec.fail"; fi ) &
   done
 
   NGPU=${SKYPILOT_NUM_GPUS_PER_NODE:-1}
   i=0
   for job in $JOBS; do
-    script=${job%%:*}; seed=${job##*:}
+    IFS=: read -r script seed dataset objective <<< "$job"
+    dataset=${dataset:-cifar10}; objective=${objective:-ddpm}
     gpu=$((i % NGPU))
-    echo "[job] GPU $gpu: bash $script $seed (log: $OUT_ROOT/logs/sky_${script%.sh}_s$seed.log)"
-    CUDA_VISIBLE_DEVICES=$gpu bash "$script" "$seed" > "logs/sky_${script%.sh}_s$seed.log" 2>&1 &
+    log="logs/sky_${script%.sh}_${dataset}_${objective}_s$seed.log"
+    echo "[job] GPU $gpu: $dataset/$objective bash $script $seed (log: $OUT_ROOT/$log)"
+    ( until [ -e "$R/$dataset:$seed.ok" ] || [ -e "$R/$dataset:$seed.fail" ]; do sleep 10; done
+      [ -e "$R/$dataset:$seed.ok" ] || { echo "[job] prefetch failed for $dataset, see logs/sky_prefetch_$dataset.log"; exit 1; }
+      echo "[job] $dataset ready, starting $script $seed on GPU $gpu"
+      DATASET=$dataset OBJECTIVE=$objective CUDA_VISIBLE_DEVICES=$gpu bash "$script" "$seed" > "$log" 2>&1 ) &
     i=$((i + 1))
   done
 

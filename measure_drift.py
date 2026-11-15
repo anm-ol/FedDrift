@@ -11,8 +11,8 @@ import wandb
 from torchvision.utils import make_grid, save_image
 
 from data import alpha_tag as tag
-from data import load_cifar10, load_cifar100, load_partition, parse_alpha, partition_path
-from diffusion import Schedule, ddpm_loss, q_sample
+from data import DATASETS, IMG_SIZE, load_cifar100, load_dataset, load_partition, parse_alpha, partition_path
+from diffusion import Schedule, ddpm_loss, q_sample, target
 from drift import measure_drift
 from fed import control_variate, fedavg, local_train
 from model import UNet
@@ -26,6 +26,8 @@ def to_wandb(x):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="cifar10", choices=DATASETS)
+    parser.add_argument("--objective", default="ddpm", choices=["ddpm", "fm"])
     parser.add_argument("--alpha", type=parse_alpha, default=0.1)
     parser.add_argument("--measure_alphas", type=parse_alpha, nargs="+", default=[0.1, 0.5, 5.0, None])
     parser.add_argument("--n_clients", type=int, default=10)
@@ -134,14 +136,18 @@ def main():
     resuming = args.resume_last or args.resume_round
     run_id = f"{args.name}_r" if (resuming and args.name) else args.name
     wandb.init(project=args.wandb_project, name=run_id or name, id=run_id, config=vars(args),
-               mode="disabled" if args.no_wandb else "online", resume="allow" if resuming else None)
+               mode="disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"), resume="allow" if resuming else None)
 
-    x_all, y_all = load_cifar10(args.data_root)
+    x_all, y_all = load_dataset(args.dataset, args.data_root)
     x_all = x_all.to(device)
-    sched = Schedule(device=device)
+    sched = Schedule(device=device, kind=args.objective)
+    if args.objective != "ddpm" and args.mix:
+        raise ValueError("--mix blends eps predictions with alphabar; DDPM only")
+    if args.share_source == "cifar100" and args.share_size and args.dataset != "cifar10":
+        raise ValueError("--share_source cifar100 is only meaningful for cifar10")
 
     def get_parts(alpha):
-        path = partition_path(args.partition_dir, args.n_clients, alpha, args.seed)
+        path = partition_path(args.partition_dir, args.n_clients, alpha, args.seed, args.dataset)
         return [torch.from_numpy(p).to(device) for p in load_partition(path)]
 
     train_parts = get_parts(args.alpha)
@@ -150,13 +156,13 @@ def main():
         pool_idx = torch.randperm(len(x_all), generator=torch.Generator().manual_seed(args.seed))[:args.pool_size].to(device)
     share = None
     if args.share_size:
-        x_test, _ = load_cifar100(args.data_root) if args.share_source == "cifar100" else load_cifar10(args.data_root, train=False)
+        x_test, _ = load_cifar100(args.data_root) if args.share_source == "cifar100" else load_dataset(args.dataset, args.data_root, train=False)
         pick = torch.randperm(len(x_test), generator=torch.Generator().manual_seed(args.seed))[:args.share_size]
         share = x_test[pick].to(device)
         del x_test
     pub = pub_held = None
     if args.repair != "none":
-        x_test, _ = load_cifar10(args.data_root, train=False)
+        x_test, _ = load_dataset(args.dataset, args.data_root, train=False)
         pick = torch.randperm(len(x_test), generator=torch.Generator().manual_seed(args.seed))
         pub = x_test[pick[:args.repair_n]].to(device)
         pub_held = x_test[pick[args.repair_n:args.repair_n + args.repair_held]].to(device)
@@ -170,11 +176,11 @@ def main():
         share_weights = torch.tensor(args.share_weights, device=device)
     measure_parts = {tag(a): get_parts(a) for a in args.measure_alphas}
 
-    model = UNet(args.model).to(device)
+    model = UNet(args.model, IMG_SIZE[args.dataset]).to(device)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location=device))
     ema = deepcopy(model).eval().requires_grad_(False)
-    print(f"{name} | {args.model} unet | {model.num_params() / 1e6:.1f}M params | {device}")
+    print(f"{name} | {args.dataset} | {args.objective} | {args.model} unet | {model.num_params() / 1e6:.1f}M params | {device}")
 
     base = os.path.join(args.out_dir, name)
     log = {"args": vars(args), "train_loss": {}, "drift": []}
@@ -265,7 +271,7 @@ def main():
                 eps = torch.randn(xb.shape, device=device, generator=g)
                 xt = q_sample(xb, t, eps, sched)
                 with torch.autocast(device.type, enabled=device.type == "cuda"):
-                    e = torch.stack([(n(xt, t).float() - eps).pow(2).mean(dim=(1, 2, 3)) for n in nets])
+                    e = torch.stack([(n(xt, t).float() - target(xb, eps, sched)).pow(2).mean(dim=(1, 2, 3)) for n in nets])
                 err += e / e.mean(0, keepdim=True)
             errs.append(err)
         err = torch.cat(errs, dim=1)
@@ -329,7 +335,7 @@ def main():
                 sb.index_add_(0, b, sp)
                 wb.index_add_(0, b, w)
                 cb.index_add_(0, b, torch.ones_like(w))
-            d = (model(xt, t).float() - eps).pow(2).mean(dim=(1, 2, 3))
+            d = (model(xt, t).float() - target(pub[i], eps, sched)).pow(2).mean(dim=(1, 2, 3))
             ropt.zero_grad(set_to_none=True)
             (w * d).mean().backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -342,7 +348,7 @@ def main():
         t = torch.randint(0, args.repair_low, (len(x0),), device=device, generator=g)
         eps = torch.randn(x0.shape, device=device, generator=g)
         model.eval()
-        return (model(q_sample(x0, t, eps, sched), t).float() - eps).pow(2).mean().item()
+        return (model(q_sample(x0, t, eps, sched), t).float() - target(x0, eps, sched)).pow(2).mean().item()
 
     def values(net, d):
         gh = grad_vec(net, *d[-1])
@@ -360,20 +366,24 @@ def main():
             tot = 0.0
             for i in range(0, len(x), 250):
                 o = net(q_sample(x[i:i + 250], t[i:i + 250], eps[i:i + 250], sched), t[i:i + 250]).float()
-                tot += (o - eps[i:i + 250]).pow(2).mean(dim=(1, 2, 3)).sum().item()
+                tot += (o - target(x[i:i + 250], eps[i:i + 250], sched)).pow(2).mean(dim=(1, 2, 3)).sum().item()
             out.append(tot / len(x))
         return out
 
     rg = None
     if args.regmean == "unif" and not args.regmean_omega:
-        x_te, y_te = load_cifar10(args.data_root, train=False)
-        own = [int(np.bincount(y_all[idx.cpu().numpy()]).argmax()) for idx in train_parts]
+        x_te, y_te = load_dataset(args.dataset, args.data_root, train=False)
         gsel = torch.Generator().manual_seed(args.seed + 4242)
+        nc = int(max(y_all.max(), y_te.max())) + 1
+        te_count = np.bincount(y_te, minlength=nc).astype(np.float64)
         val = []
-        for c in own:
-            ids = np.where(y_te == c)[0]
-            ids = ids[torch.randperm(len(ids), generator=gsel)[:args.regmean_val].numpy()]
-            val.append(x_te[ids].to(device))
+        for idx in train_parts:
+            # test images drawn to match this client's label mix (= its own class under the
+            # one-class-per-client CIFAR split; a mixture for Tiny-ImageNet/CelebA splits)
+            mix = np.bincount(y_all[idx.cpu().numpy()], minlength=nc).astype(np.float64)
+            w = torch.from_numpy(mix[y_te] / np.maximum(te_count[y_te], 1))
+            ids = torch.multinomial(w, min(args.regmean_val, int((w > 0).sum())), replacement=False, generator=gsel).numpy()
+            val.append(x_te[np.sort(ids)].to(device))
         hold = x_te[torch.randperm(len(x_te), generator=gsel)[:args.heldout_n]].to(device)
         del x_te
         rg = {"val": val, "hold": hold, "rho": [args.regmean_strength] * nb, "signal": None}

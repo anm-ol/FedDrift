@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from data import random_flip
-from diffusion import ddpm_loss, q_sample
+from diffusion import ddpm_loss, q_sample, target
 
 
 def local_train(model, x_all, idx, sched, epochs, batch_size, lr, grad_clip=1.0, pool_range=None,
@@ -59,7 +59,7 @@ def local_train(model, x_all, idx, sched, epochs, batch_size, lr, grad_clip=1.0,
                     w = torch.full_like(tp, distill, dtype=torch.float)
                     if prox_rel is not None:
                         w = w * prox_rel[(tp * len(prox_rel)) // sched.T]
-                    loss = (pred[:n] - eps).pow(2).mean()
+                    loss = (pred[:n] - target(x0, eps, sched)).pow(2).mean()
                     full = loss + (w.view(-1, 1, 1, 1) * (pred[n:] - anchor).pow(2)).mean()
                     if dev_stats is not None:
                         with torch.no_grad():
@@ -80,7 +80,7 @@ def local_train(model, x_all, idx, sched, epochs, batch_size, lr, grad_clip=1.0,
                         w = w * ((t >= prox_range[0]) & (t < prox_range[1])).float()
                     if prox_rel is not None:
                         w = w * prox_rel[(t * len(prox_rel)) // sched.T]
-                    loss = (pred - eps).pow(2).mean()
+                    loss = (pred - target(x0, eps, sched)).pow(2).mean()
                     full = loss + (w.view(-1, 1, 1, 1) * (pred - anchor).pow(2)).mean()
                     if dev_stats is not None:
                         with torch.no_grad():

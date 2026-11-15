@@ -6,6 +6,7 @@ import torch.nn as nn
 from torchvision.utils import save_image
 
 from diffusion import Schedule, ddpm_sample, q_sample
+from data import DATASETS, IMG_SIZE
 from model import UNet
 
 
@@ -69,35 +70,42 @@ class Routed(nn.Module):
         return out
 
 
-def load(path, size, device):
-    model = UNet(size).to(device)
+def load(path, size, device, img_size=32):
+    model = UNet(size, img_size).to(device)
     model.load_state_dict(torch.load(path, map_location=device))
     return model.eval()
 
 
 def build(args, device, sched=None):
-    model = load(args.ckpt, args.model, device)
+    img = IMG_SIZE[getattr(args, "dataset", "cifar10")]
+    model = load(args.ckpt, args.model, device, img)
     name = os.path.splitext(args.ckpt)[0]
     if getattr(args, "experts", None):
-        clients = [load(f"{args.experts}_client{i}.pt", args.model, device) for i in range(args.n_clients)]
+        assert sched.kind == "ddpm", "expert routing inverts DDPM steps"
+        clients = [load(f"{args.experts}_client{i}.pt", args.model, device, img) for i in range(args.n_clients)]
         b = args.expert_bands
         bands = [(b[i], b[i + 1]) for i in range(0, len(b), 2)]
         model = Routed(model, clients, bands, sched, args.draws, args.seed)
         name = args.experts + "_exp" + "_".join(f"{lo}-{hi}" for lo, hi in bands)
     if args.swap_ckpt:
         lo, hi = args.swap_range
-        model = Swap(model, load(args.swap_ckpt, args.model, device), lo, hi)
+        model = Swap(model, load(args.swap_ckpt, args.model, device, img), lo, hi)
         name += f"_swap{lo}-{hi}"
     return model, name
 
 
+def img_size(model):
+    return next(m.img_size for m in model.modules() if isinstance(m, UNet))
+
+
 def generate(model, n, sched, device, seed=0, batch=1000):
     gen = torch.Generator(device=device).manual_seed(seed)
+    s = img_size(model)
     out = []
     for i in range(0, n, batch):
         b = min(batch, n - i)
         with torch.autocast(device.type, enabled=(device.type == "cuda")):
-            x = ddpm_sample(model, (b, 3, 32, 32), sched, device, gen)
+            x = ddpm_sample(model, (b, 3, s, s), sched, device, gen)
         out.append((x.clamp(-1, 1) + 1) / 2)
     return torch.cat(out)
 
@@ -111,11 +119,13 @@ def main():
     parser.add_argument("--out", default=None)
     parser.add_argument("--swap_ckpt", default=None)
     parser.add_argument("--swap_range", type=int, nargs=2, default=None)
+    parser.add_argument("--dataset", default="cifar10", choices=DATASETS)
+    parser.add_argument("--objective", default="ddpm", choices=["ddpm", "fm"])
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sched = Schedule(device=device)
-    model, name = build(args, device)
+    sched = Schedule(device=device, kind=args.objective)
+    model, name = build(args, device, sched)
 
     x = generate(model, args.n, sched, device, args.seed)
     out = args.out or name + "_samples.png"

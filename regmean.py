@@ -33,7 +33,7 @@ def grams(model, x, sched, bands, n, batch, gen):
             b = min(batch, n - i)
             idx = torch.randint(0, len(x), (b,), device=x.device, generator=gen)
             t = torch.randint(lo, hi, (b,), device=x.device, generator=gen)
-            eps = torch.randn((b, 3, 32, 32), device=x.device, generator=gen)
+            eps = torch.randn((b, *x.shape[1:]), device=x.device, generator=gen)
             model(q_sample(x[idx], t, eps, sched), t)
         for name in out:
             out[name].append(cur[name] / cnt[name])

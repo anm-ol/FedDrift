@@ -4,7 +4,7 @@ import time
 import torch
 from torchmetrics.image.fid import FrechetInceptionDistance
 
-from data import load_cifar10
+from data import DATASETS, load_dataset
 from diffusion import Schedule
 from sample import build, generate
 
@@ -27,16 +27,18 @@ def main():
     parser.add_argument("--wandb_id", default=None)
     parser.add_argument("--wandb_project", default="timestep-drift")
     parser.add_argument("--round", type=int, default=0)
+    parser.add_argument("--dataset", default="cifar10", choices=DATASETS)
+    parser.add_argument("--objective", default="ddpm", choices=["ddpm", "fm"])
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sched = Schedule(device=device)
+    sched = Schedule(device=device, kind=args.objective)
     model, name = build(args, device, sched)
     t0 = time.time()
 
     fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
 
-    real, _ = load_cifar10(args.data_root)
+    real, _ = load_dataset(args.dataset, args.data_root)  # 50k training images for every dataset
     for i in range(0, len(real), args.batch):
         fid.update(((real[i:i + args.batch] + 1) / 2).to(device), real=True)
     print(f"real features done | {time.time() - t0:.0f}s", flush=True)
