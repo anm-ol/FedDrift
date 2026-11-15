@@ -8,7 +8,7 @@ from diffusion import ddpm_loss, q_sample, target
 def local_train(model, x_all, idx, sched, epochs, batch_size, lr, grad_clip=1.0, pool_range=None,
                 ref=None, prox=0.0, prox_range=None, corr=None, pool_idx=None, share=None, share_range=None,
                 share_batch=0, share_weights=None, prox_rel=None, dev_stats=None, probes=None, distill=0.0,
-                distill_batch=32):
+                distill_batch=32, max_steps=None):
     device = x_all.device
     params = list(model.parameters())
     gsum = torch.zeros((), device=device)
@@ -21,6 +21,8 @@ def local_train(model, x_all, idx, sched, epochs, batch_size, lr, grad_clip=1.0,
     for _ in range(epochs):
         perm = idx[torch.randperm(len(idx), device=device)]
         for i in range(0, len(perm), batch_size):
+            if max_steps is not None and steps >= max_steps:
+                break
             x0 = random_flip(x_all[perm[i:i + batch_size]])
             t = torch.randint(0, sched.T, (x0.shape[0],), device=device)
             eps = torch.randn_like(x0)

@@ -2,6 +2,7 @@ import torch.nn as nn
 from diffusers import UNet2DModel
 
 WIDTHS = {
+    "tiny": (32, 64, 64, 64),
     "small": (64, 128, 128, 128),
     "standard": (128, 256, 256, 256),
 }
